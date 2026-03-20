@@ -1,0 +1,13 @@
+# Git ignore rules for SoDe_Avalon_3
+
+# Ignore model parameter files (large binaries). Keep code/config tracked.
+small_model/**/*.pt
+small_model/**/*.bin
+small_model/**/*.pth
+small_model/**/*.ckpt
+small_model/**/*.safetensors
+
+# Ignore training/inference logs
+logs/
+ex_log/
+
