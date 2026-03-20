@@ -23,6 +23,7 @@ class AvalonCritic(nn.Module):
         max_text_len: int = 256,
         use_causal_mask: bool = True,
         use_text_cache: bool = True,
+        qwen_model_path: Optional[str] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
@@ -34,7 +35,7 @@ class AvalonCritic(nn.Module):
         self.token_encoder = SimpleTokenEncoder(
             d_model=d_model,
             max_round_attempt_id=max_round_attempt_id,
-            qwen_model_path=None,
+            qwen_model_path=qwen_model_path,
             finetune_text_encoder=False,
         )
 

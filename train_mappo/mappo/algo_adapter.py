@@ -61,19 +61,52 @@ class MAPPOCTDEAdapter:
         *,
         terminal_reward: float,
         gamma: float,
+        use_gae: bool = True,
+        gae_lambda: float = 1.0,
     ) -> None:
         """
-        稀疏终局 reward：returns = gamma^(T-1-t) * R_terminal
-        advantages = returns - old_value
+        稀疏终局 reward：假设 reward 序列只有最后一步非零：
+          - r_t = 0 (t < T-1)
+          - r_{T-1} = R_terminal
+
+        - 当 use_gae=False：退化为 Monte-Carlo / return-to-go（当前实现逻辑）
+        - 当 use_gae=True：使用 GAE(lambda) 计算 advantages 与 returns
         """
         if not transitions:
             return
         T = len(transitions)
+
+        terminal_reward = float(terminal_reward)
+        gamma = float(gamma)
+
+        if not use_gae:
+            # return-to-go：returns = gamma^(T-1-t) * R_terminal, advantages = returns - old_value
+            for t in range(T):
+                returns_t = (gamma ** (T - 1 - t)) * terminal_reward
+                old_value = float(transitions[t]["old_value"])
+                transitions[t]["returns"] = float(returns_t)
+                transitions[t]["advantages"] = float(returns_t - old_value)
+            return
+
+        # GAE(lambda) for sparse terminal reward
+        values = [float(t["old_value"]) for t in transitions]
+        gae_lambda = float(gae_lambda)
+        advantages = [0.0 for _ in range(T)]
+
+        adv_next = 0.0  # advantage at t+1
+        for t in reversed(range(T)):
+            reward_t = 0.0 if t < (T - 1) else terminal_reward
+            value_t = values[t]
+            value_tp1 = 0.0 if t == (T - 1) else values[t + 1]
+            delta_t = reward_t + gamma * value_tp1 - value_t
+            adv_t = delta_t + gamma * gae_lambda * adv_next
+            advantages[t] = adv_t
+            adv_next = adv_t
+
         for t in range(T):
-            returns = (gamma ** (T - 1 - t)) * float(terminal_reward)
-            old_value = float(transitions[t]["old_value"])
-            transitions[t]["returns"] = float(returns)
-            transitions[t]["advantages"] = float(returns - old_value)
+            returns_t = advantages[t] + values[t]
+            transitions[t]["returns"] = float(returns_t)
+            transitions[t]["advantages"] = float(advantages[t])
 
     def _stack_obs_state(self, transitions: List[Dict[str, Any]], indices: List[int]) -> List[Dict[str, Any]]:
         # 由于每个决策点 token 序列长度可能不同，我们在 stack 前做 padding。
@@ -203,6 +236,8 @@ class MAPPOCTDEAdapter:
         ppo_epochs: int,
         minibatch_size: int,
         batch_size: int,
+        transition_weights: Optional[List[float]] = None,
+        critic_only: bool = False,
     ) -> Dict[str, float]:
         if not transitions:
             return {}
@@ -212,6 +247,12 @@ class MAPPOCTDEAdapter:
         old_logps = torch.tensor([t["old_log_prob"] for t in transitions], device=self.device, dtype=torch.float32)
         returns = torch.tensor([t["returns"] for t in transitions], device=self.device, dtype=torch.float32)
         advantages = torch.tensor([t["advantages"] for t in transitions], device=self.device, dtype=torch.float32)
+        if transition_weights is None:
+            weights = torch.ones((N,), device=self.device, dtype=torch.float32)
+        else:
+            if len(transition_weights) != N:
+                raise ValueError(f"transition_weights length mismatch: got {len(transition_weights)} vs N={N}")
+            weights = torch.tensor(transition_weights, device=self.device, dtype=torch.float32)
 
         policy_loss_acc = 0.0
         value_loss_acc = 0.0
@@ -224,8 +265,9 @@ class MAPPOCTDEAdapter:
         indices_all = list(range(N))
 
         # 训练模式
-        self.actor.train()
         self.critic.train()
+        if not critic_only:
+            self.actor.train()
 
         for epoch in range(int(ppo_epochs)):
             random.shuffle(indices_all)
@@ -238,51 +280,89 @@ class MAPPOCTDEAdapter:
 
                 batch_obs, batch_state = self._stack_obs_state(transitions, idxs)
 
-                # forward：actor/critic
-                outputs_list = self.actor.model(batch_obs)
                 values = self.critic(batch_state)  # (B,)
-
-                # new log_prob
-                new_logps = self._compute_log_probs_for_minibatch(
-                    outputs_list=outputs_list,
-                    transitions=transitions,
-                    indices=idxs,
-                )
-                entropies = getattr(self, "_last_entropy")
 
                 old_logp_b = old_logps[idxs]
                 adv_b = advantages[idxs]
                 ret_b = returns[idxs]
+                w_b = weights[idxs]
 
-                ratios = torch.exp(new_logps - old_logp_b)
-                clipped = torch.clamp(ratios, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio)
-                policy_loss = -torch.min(ratios * adv_b, clipped * adv_b).mean()
+                # PPO stability: Advantage normalization per mini-batch
+                adv_std = adv_b.std(unbiased=False)
+                adv_b = (adv_b - adv_b.mean()) / (adv_std + 1e-8)
 
-                value_loss = torch.mean((values - ret_b) ** 2)
-                entropy_mean = entropies.mean()
+                if not critic_only:
+                    # forward：actor (only needed for policy / entropy losses)
+                    outputs_list = self.actor.model(batch_obs)
 
-                total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_mean
+                    # new log_prob
+                    new_logps = self._compute_log_probs_for_minibatch(
+                        outputs_list=outputs_list,
+                        transitions=transitions,
+                        indices=idxs,
+                    )
+                    entropies = getattr(self, "_last_entropy")
+
+                    ratios = torch.exp(new_logps - old_logp_b)
+                    clipped = torch.clamp(ratios, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio)
+
+                    # policy objective (min of clipped and unclipped)
+                    policy_losses = -torch.min(ratios * adv_b, clipped * adv_b)  # (B,)
+                    if float(w_b.sum().item()) > 0:
+                        policy_loss = (policy_losses * w_b).sum() / w_b.sum()
+                    else:
+                        policy_loss = policy_losses.mean()
+
+                    entropy_mean = entropies
+                    if float(w_b.sum().item()) > 0:
+                        entropy_mean = (entropies * w_b).sum() / w_b.sum()
+                    else:
+                        entropy_mean = entropies.mean()
+
+                    value_loss_raw = (values - ret_b) ** 2  # (B,)
+                    if float(w_b.sum().item()) > 0:
+                        value_loss = (value_loss_raw * w_b).sum() / w_b.sum()
+                    else:
+                        value_loss = value_loss_raw.mean()
+
+                    total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_mean
+                else:
+                    # critic-only warmup：跳过 actor/policy/entropy，避免共享参数震荡
+                    value_loss_raw = (values - ret_b) ** 2  # (B,)
+                    if float(w_b.sum().item()) > 0:
+                        value_loss = (value_loss_raw * w_b).sum() / w_b.sum()
+                    else:
+                        value_loss = value_loss_raw.mean()
+                    policy_loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+                    entropy_mean = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+                    total_loss = self.value_coef * value_loss
 
                 # backward
-                self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
+                if not critic_only:
+                    self.actor_optimizer.zero_grad()
                 total_loss.backward()
 
                 if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip)
+                    if not critic_only:
+                        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip)
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip)
 
-                self.actor_optimizer.step()
                 self.critic_optimizer.step()
+                if not critic_only:
+                    self.actor_optimizer.step()
 
                 # metrics
                 with torch.no_grad():
-                    clip_frac = float(((torch.abs(ratios - 1.0) > self.clip_ratio)).float().mean().item())
-                    approx_kl = float((old_logp_b - new_logps).mean().item())
-
-                    policy_loss_acc += float(policy_loss.item())
                     value_loss_acc += float(value_loss.item())
-                    entropy_acc += float(entropy_mean.item())
+                    if not critic_only:
+                        policy_loss_acc += float(policy_loss.item())
+                        entropy_acc += float(entropy_mean.item())
+                        clip_frac = float(((torch.abs(ratios - 1.0) > self.clip_ratio)).float().mean().item())
+                        approx_kl = float((old_logp_b - new_logps).mean().item())
+                    else:
+                        clip_frac = 0.0
+                        approx_kl = 0.0
                     total_loss_acc += float(total_loss.item())
                     clip_frac_acc += clip_frac
                     approx_kl_acc += approx_kl
@@ -291,9 +371,9 @@ class MAPPOCTDEAdapter:
         if steps == 0:
             return {}
         return {
-            "policy_loss": policy_loss_acc / steps,
             "value_loss": value_loss_acc / steps,
-            "entropy": entropy_acc / steps,
+            "policy_loss": (policy_loss_acc / steps) if not critic_only else 0.0,
+            "entropy": (entropy_acc / steps) if not critic_only else 0.0,
             "total_loss": total_loss_acc / steps,
             "clip_fraction": clip_frac_acc / steps,
             "approx_kl": approx_kl_acc / steps,

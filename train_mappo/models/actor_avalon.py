@@ -33,6 +33,7 @@ class AvalonActor(nn.Module):
         max_text_len: int = 256,
         use_causal_mask: bool = True,
         use_text_cache: bool = True,
+        qwen_model_path: Optional[str] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
@@ -41,7 +42,7 @@ class AvalonActor(nn.Module):
             n_heads=n_heads,
             n_layers=n_layers,
             max_round_attempt_id=max_round_attempt_id,
-            qwen_model_path=None,
+            qwen_model_path=qwen_model_path,
             finetune_text_encoder=False,
             max_seq_len=max_seq_len,
             max_text_len=max_text_len,
